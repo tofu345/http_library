@@ -71,12 +71,12 @@ impl Router {
                 println!("-> {}", req.path);
 
                 if let Some(route) = route {
-                    if !route.has_method(req.method.as_str()) {
+                    if !route.methods.contains(&req.method) {
                         handle(method_not_allowed_handler, req, stream);
                         return;
                     }
 
-                    handle(route.handler, req, stream)
+                    handle(route.handler, req, stream);
                 } else {
                     handle(not_found_handler, req, stream);
                 }
@@ -85,7 +85,7 @@ impl Router {
     }
 }
 
-/// Runs handler in seperate thread and writes data to stream
+/// Runs handler and writes data to stream
 fn handle(f: Handler, req: Request, mut stream: TcpStream) {
     let mut res = f(&req);
 
@@ -109,7 +109,7 @@ fn handle(f: Handler, req: Request, mut stream: TcpStream) {
 }
 
 fn method_not_allowed_handler(_req: &Request) -> Response {
-    Response::new(404, "method not allowed")
+    Response::new(405, "method not allowed")
 }
 
 fn not_found_handler(_req: &Request) -> Response {
@@ -124,10 +124,6 @@ struct Route {
 }
 
 impl Route {
-    fn has_method(&self, method: &str) -> bool {
-        self.methods.contains(&method.to_owned())
-    }
-
     fn match_route<'a>(routes: &'a Vec<Route>, path: &str) -> Option<&'a Route> {
         routes.iter().find(|r| {
             if r.path.contains(":?") {
