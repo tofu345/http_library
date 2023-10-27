@@ -89,10 +89,10 @@ impl Router {
 
                 let handler: Handler = match route {
                     Some(route) => {
-                        if !route.methods.contains(&req.method) {
-                            method_not_allowed_handler
-                        } else {
+                        if route.methods.contains(&req.method) {
                             route.handler
+                        } else {
+                            method_not_allowed_handler
                         }
                     }
                     None => not_found_handler,
