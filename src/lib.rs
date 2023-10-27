@@ -1,8 +1,8 @@
 use std::fmt::Display;
-use std::io::Write;
-use std::net::TcpStream;
 use std::sync::Arc;
-use std::{collections::HashMap, error::Error, io, net::TcpListener, thread};
+use std::{collections::HashMap, io};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 pub struct Router {
     host: String,
@@ -57,55 +57,66 @@ impl Router {
     }
 
     /// Runs Tcp Server on specified port
-    pub fn serve(&self) {
-        let listener = TcpListener::bind(self.host.clone()).unwrap();
+    pub async fn serve(&self) -> io::Result<()> {
+        let listener = TcpListener::bind(self.host.clone()).await?;
         let routes = Arc::new(self.routes.to_vec());
 
-        while let Ok((mut stream, _addr)) = listener.accept() {
+        loop {
+            let (mut socket, _) = listener.accept().await?;
             let routes = Arc::clone(&routes);
 
-            thread::spawn(move || {
-                let req = Request::from_stream(&mut stream);
+            tokio::spawn(async move {
+                let mut buf = [0; 4096];
+
+                let n = match socket.read(&mut buf).await {
+                    Ok(n) if n == 0 => return,
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("failed to read from socket; err = {:?}", e);
+                        return;
+                    }
+                };
+
+                let req = Request::from_utf8(&mut buf[0..n]);
+                if let Err(ref err) = req {
+                    eprintln!("{}", err);
+                    return;
+                };
+                let req = req.unwrap();
                 let route = Route::match_route(&routes, req.path.as_str());
 
                 println!("-> {}", req.path);
 
-                if let Some(route) = route {
-                    if !route.methods.contains(&req.method) {
-                        handle(method_not_allowed_handler, req, stream);
-                        return;
+                let handler: Handler = match route {
+                    Some(route) => {
+                        if !route.methods.contains(&req.method) {
+                            method_not_allowed_handler
+                        } else {
+                            route.handler
+                        }
                     }
+                    None => not_found_handler,
+                };
 
-                    handle(route.handler, req, stream);
-                } else {
-                    handle(not_found_handler, req, stream);
-                }
+                let res = handler(&req);
+                let mut output = format!(
+                    "HTTP/1.1 {} {}\r\n",
+                    res.code,
+                    if res.code == 200 { "OK" } else { " " }
+                );
+
+                output.push_str(&res.to_string());
+
+                if let Err(e) = socket.write_all(output.as_bytes()).await {
+                    eprintln!("Error writing response: {}", e);
+                };
+
+                if let Err(e) = socket.flush().await {
+                    eprintln!("Error flushing response: {}", e);
+                };
             });
         }
     }
-}
-
-/// Runs handler and writes data to stream
-fn handle(f: Handler, req: Request, mut stream: TcpStream) {
-    let mut res = f(&req);
-
-    write!(
-        stream,
-        "HTTP/1.1 {} {}\r\n",
-        res.code,
-        if res.code == 200 { "OK" } else { " " },
-    )
-    .unwrap();
-
-    if let Some(data) = res.data.take() {
-        res.write_headers(&mut stream)
-            .expect("failure writing headers");
-        stream.write_all(format!("{}", data).as_bytes()).unwrap();
-    } else {
-        write!(stream, "\r\n").expect("failure writing newline");
-    }
-
-    stream.flush().unwrap();
 }
 
 fn method_not_allowed_handler(_req: &Request) -> Response {
@@ -148,19 +159,35 @@ pub struct Request {
 }
 
 impl Request {
-    fn from_utf8(data: &[u8]) -> Result<Request, Box<dyn Error>> {
-        Request::parse(String::from_utf8(data.to_vec())?)
+    fn from_utf8(data: &[u8]) -> Result<Request, &'static str> {
+        let data = match String::from_utf8(data.to_vec()) {
+            Ok(v) => v,
+            Err(_) => return Err("Error converting http request to string"),
+        };
+
+        Request::parse(data)
     }
 
-    fn parse(data: String) -> Result<Request, Box<dyn Error>> {
+    fn parse(data: String) -> Result<Request, &'static str> {
         let data = data.replace("\0", "");
         let mut lines = data.split("\r\n");
 
-        let line = lines.next().expect("invalid http data");
+        let line = match lines.next() {
+            Some(v) => v,
+            None => return Err("invalid http data"),
+        };
+
         let line: Vec<&str> = line.split(" ").collect();
 
-        let method = line.get(0).expect("missing method in request").to_string();
-        let path = line.get(1).expect("missing path in request").to_string();
+        let method = match line.get(0) {
+            Some(v) => v.to_string(),
+            None => return Err("missing method in request"),
+        };
+        let path = match line.get(1) {
+            Some(v) => v.to_string(),
+            None => return Err("missing path in request"),
+        };
+
         let mut headers = HashMap::new();
 
         for line in lines {
@@ -177,13 +204,6 @@ impl Request {
             headers,
             body: data[data.len() - 1].to_string(),
         })
-    }
-
-    fn from_stream(s: &mut impl io::Read) -> Request {
-        let mut buffer = [0; 4096];
-        s.read(&mut buffer).unwrap();
-
-        Request::from_utf8(&buffer).unwrap()
     }
 }
 
@@ -213,7 +233,7 @@ where
 
 pub struct Response {
     code: u16,
-    data: Option<Box<dyn Display + 'static>>,
+    data: Option<Box<dyn Display + Send + 'static>>,
     headers: HashMap<String, String>,
 }
 
@@ -228,12 +248,12 @@ impl Response {
     ///     Response::new(200, "hi")
     /// }
     /// ```
-    pub fn new(code: u16, data: impl Display + 'static) -> Response {
+    pub fn new(code: u16, data: impl Display + Send + 'static) -> Response {
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_owned(), "text/plain".to_owned());
         headers.insert(
             "Content-Length".to_owned(),
-            format!("{}", data).as_bytes().len().to_string(),
+            data.to_string().len().to_string(),
         );
 
         Response {
@@ -279,8 +299,8 @@ impl Response {
     /// ```
     pub fn json<K, V>(code: u16, data: HashMap<K, V>) -> Response
     where
-        K: Display + 'static,
-        V: Display + 'static,
+        K: Display + Send + 'static,
+        V: Display + Send + 'static,
     {
         Response {
             code,
@@ -327,13 +347,21 @@ impl Response {
         self.headers.insert(key.to_owned(), val.to_owned());
     }
 
-    fn write_headers(&self, f: &mut impl io::Write) -> io::Result<()> {
+    fn to_string(&self) -> String {
         let mut output = String::new();
         for (key, val) in self.headers.iter() {
-            output.push_str(format!("{key}: {val}\r\n").as_str());
+            output.push_str(&format!("{key}: {val}\r\n"));
+        }
+
+        if self.headers.len() != 0 {
+            output.push_str("\r\n")
+        };
+
+        if let Some(ref data) = self.data {
+            output.push_str(&format!("{}", data));
         }
 
         output.push_str("\r\n");
-        write!(f, "{}", output)
+        format!("{}", output)
     }
 }
