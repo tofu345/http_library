@@ -11,6 +11,7 @@ pub struct Router {
 
 impl Router {
     /// # Examples
+    ///
     /// ```
     /// use http_library::Router;
     ///
@@ -28,6 +29,7 @@ impl Router {
     /// Routes are matched in the order they are added
     ///
     /// # Examples
+    ///
     /// ```
     /// use http_library::{Router, Request, Response};
     ///
@@ -72,22 +74,19 @@ impl Router {
                     Ok(n) if n == 0 => return,
                     Ok(n) => n,
                     Err(e) => {
-                        eprintln!("failed to read from socket; err = {:?}", e);
+                        eprintln!("failed to read from socket: {:?}", e);
                         return;
                     }
                 };
 
-                let req = Request::from_utf8(&mut buf[0..n]);
-                if let Err(ref err) = req {
-                    eprintln!("{}", err);
-                    return;
+                let req = match Request::from_utf8(&mut buf[0..n]) {
+                    Ok(v) => v,
+                    Err(e) => panic!("{}", e),
                 };
-                let req = req.unwrap();
-                let route = Route::match_route(&routes, req.path.as_str());
 
                 println!("-> {}", req.path);
 
-                let handler: Handler = match route {
+                let handler: Handler = match Route::match_route(&routes, req.path.as_str()) {
                     Some(route) => {
                         if route.methods.contains(&req.method) {
                             route.handler
@@ -108,11 +107,11 @@ impl Router {
                 output.push_str(&res.to_string());
 
                 if let Err(e) = socket.write_all(output.as_bytes()).await {
-                    eprintln!("Error writing response: {}", e);
+                    eprintln!("error writing response: {}", e);
                 };
 
                 if let Err(e) = socket.flush().await {
-                    eprintln!("Error flushing response: {}", e);
+                    eprintln!("error flushing response: {}", e);
                 };
             });
         }
@@ -162,7 +161,7 @@ impl Request {
     fn from_utf8(data: &[u8]) -> Result<Request, &'static str> {
         let data = match String::from_utf8(data.to_vec()) {
             Ok(v) => v,
-            Err(_) => return Err("Error converting http request to string"),
+            Err(_) => return Err("error converting request bytes to string"),
         };
 
         Request::parse(data)
@@ -189,7 +188,6 @@ impl Request {
         };
 
         let mut headers = HashMap::new();
-
         for line in lines {
             if let Some((k, v)) = line.split_once(": ") {
                 headers.insert(k.to_string(), v.to_string());
@@ -197,7 +195,6 @@ impl Request {
         }
 
         let data: Vec<&str> = data.split("\r\n").collect();
-
         Ok(Request {
             method,
             path,
@@ -226,19 +223,22 @@ where
             }
         }
 
-        string.push_str("}");
+        string.push('}');
         write!(f, "{}", string)
     }
 }
 
+pub type ResponseData = Box<dyn Display + Send + 'static>;
+
 pub struct Response {
     code: u16,
-    data: Option<Box<dyn Display + Send + 'static>>,
+    data: Option<ResponseData>,
     headers: HashMap<String, String>,
 }
 
 impl Response {
     /// Returns new Response
+    ///
     /// # Example
     ///
     /// ```
@@ -358,10 +358,11 @@ impl Response {
         };
 
         if let Some(ref data) = self.data {
-            output.push_str(&format!("{}", data));
+            output.push_str(&data.to_string());
         }
 
         output.push_str("\r\n");
         format!("{}", output)
     }
 }
+
