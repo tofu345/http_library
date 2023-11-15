@@ -1,8 +1,13 @@
+use std::collections::HashMap;
+use std::error::Error;
 use std::fmt::Display;
+use std::fs;
+use std::io::{prelude::*, Read};
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::{collections::HashMap, io};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use threads::ThreadPool;
+
+mod threads;
 
 pub struct Router {
     host: String,
@@ -59,63 +64,76 @@ impl Router {
     }
 
     /// Runs Tcp Server on specified port
-    pub async fn serve(&self) -> io::Result<()> {
-        let listener = TcpListener::bind(self.host.clone()).await?;
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use http_library::{Router, Request, Response};
+    ///
+    /// fn run() {
+    ///     let mut r = Router::new("127.0.0.1:8000");
+    ///
+    ///     r.handle_func("/", home, vec!["GET"]);
+    ///     r.serve().unwrap();
+    /// }
+    ///
+    /// fn home(r: &Request) -> Response {
+    ///     Response::new(200, "hi")
+    /// }
+    /// ```
+    pub fn serve(&self) -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind(self.host.clone()).unwrap();
         let routes = Arc::new(self.routes.to_vec());
+        let pool = ThreadPool::build(4).unwrap();
 
-        loop {
-            let (mut socket, _) = listener.accept().await?;
+        for stream in listener.incoming() {
+            let stream = stream.unwrap();
             let routes = Arc::clone(&routes);
 
-            tokio::spawn(async move {
-                let mut buf = [0; 4096];
-
-                let n = match socket.read(&mut buf).await {
-                    Ok(n) if n == 0 => return,
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("failed to read from socket: {:?}", e);
-                        return;
-                    }
-                };
-
-                let req = match Request::from_utf8(&mut buf[0..n]) {
-                    Ok(v) => v,
-                    Err(e) => panic!("{}", e),
-                };
-
-                println!("-> {}", req.path);
-
-                let handler: Handler = match Route::match_route(&routes, req.path.as_str()) {
-                    Some(route) => {
-                        if route.methods.contains(&req.method) {
-                            route.handler
-                        } else {
-                            method_not_allowed_handler
-                        }
-                    }
-                    None => not_found_handler,
-                };
-
-                let res = handler(&req);
-                let mut output = format!(
-                    "HTTP/1.1 {} {}\r\n",
-                    res.code,
-                    if res.code == 200 { "OK" } else { " " }
-                );
-
-                output.push_str(&res.to_string());
-
-                if let Err(e) = socket.write_all(output.as_bytes()).await {
-                    eprintln!("error writing response: {}", e);
-                };
-
-                if let Err(e) = socket.flush().await {
-                    eprintln!("error flushing response: {}", e);
-                };
+            pool.execute(move || {
+                handle_connection(stream, Arc::clone(&routes));
             });
         }
+
+        Ok(())
     }
+}
+
+fn handle_connection(mut stream: TcpStream, routes: Arc<Vec<Route>>) {
+    let mut buf = [0; 4096];
+    let n = stream.read(&mut buf).unwrap();
+    if n == 0 {
+        // todo: Return err
+    }
+
+    let req = match Request::from_utf8(&mut buf[0..n]) {
+        Ok(v) => v,
+        Err(e) => panic!("{}", e),
+    };
+
+    println!("-> {}", req.path);
+
+    let handler: Handler = match Route::match_route(&routes, req.path.as_str()) {
+        Some(route) => {
+            if route.methods.contains(&req.method) {
+                route.handler
+            } else {
+                method_not_allowed_handler
+            }
+        }
+        None => not_found_handler,
+    };
+
+    let res = handler(&req);
+    let output = format!(
+        "HTTP/1.1 {} {}\r\n{}",
+        res.code,
+        if res.code == 200 { "OK" } else { " " },
+        res.to_string()
+    );
+
+    stream.write_all(output.as_bytes()).unwrap();
+    stream.flush().unwrap();
 }
 
 fn method_not_allowed_handler(_req: &Request) -> Response {
@@ -310,6 +328,28 @@ impl Response {
         .add_header("Content-Type", "application/json")
     }
 
+    /// Returns response containing file
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use http_library::{Request, Response};
+    ///
+    /// fn test(_req: &Request) -> Response {
+    ///     Response::file(200, "templates/index.html")
+    /// }
+    /// ```
+    pub fn file(code: u16, path: &str) -> Response {
+        let contents = fs::read_to_string(path).unwrap();
+
+        Response {
+            code,
+            data: Some(Box::new(contents)),
+            headers: HashMap::new(),
+        }
+        .add_header("Content-Type", "text/html")
+    }
+
     /// Returns new response with specified headers
     ///
     /// # Example
@@ -365,4 +405,3 @@ impl Response {
         format!("{}", output)
     }
 }
-
